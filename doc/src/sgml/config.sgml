@@ -3209,6 +3209,54 @@ include_dir 'conf.d'
        </listitem>
       </varlistentry>
 
+      <varlistentry id="guc-parallel-worker-queue-timeout" xreflabel="parallel_worker_queue_timeout">
+       <term><varname>parallel_worker_queue_timeout</varname> (<type>integer</type>)
+       <indexterm>
+        <primary><varname>parallel_worker_queue_timeout</varname> configuration parameter</primary>
+       </indexterm>
+       </term>
+       <listitem>
+        <para>
+         Sets the maximum time that a parallel leader waits for parallel
+         worker capacity when fewer workers are available than it wants to
+         launch, or than could ever be obtained given
+         <xref linkend="guc-max-parallel-workers"/> and
+         <xref linkend="guc-max-worker-processes"/>.  When the wait ends,
+         either because enough workers became available or because the
+         timeout expired, the leader launches as many workers as are
+         available at that point, possibly none.
+         If this value is specified without units, it is taken as
+         milliseconds.  The default value of zero disables waiting, so that
+         the leader proceeds at once with whatever workers are available.
+        </para>
+        <para>
+         This setting applies to parallel queries, parallel index builds, and
+         <command>VACUUM</command> with the <literal>PARALLEL</literal>
+         option, but not to autovacuum or to parallel workers themselves.
+         A leader that already holds parallel workers through another
+         parallel operation that is still in progress (for example, a second
+         <literal>Gather</literal> node running in the same plan) does not
+         wait.  Within a single parallel operation, once a wait has timed out,
+         later relaunches of its workers (for example on rescan) do not wait
+         again.
+        </para>
+        <para>
+         Time spent waiting counts toward
+         <xref linkend="guc-statement-timeout"/>, and the wait can be
+         canceled.  A waiting session is shown in
+         <structname>pg_stat_activity</structname> with the wait event
+         <literal>ParallelWorkerQueue</literal> (see
+         <xref linkend="wait-event-ipc-table"/>).  While waiting, the leader
+         keeps any locks and snapshot it already holds, so long timeouts can
+         delay other sessions and hold back vacuum cleanup.  The wait is not
+         part of deadlock detection, which is why there is no setting for an
+         unlimited wait.  Waiting is best effort: there is no ordering or
+         fairness among waiting sessions, so a session requesting many
+         workers can repeatedly lose to sessions requesting fewer.
+        </para>
+       </listitem>
+      </varlistentry>
+
       <varlistentry id="guc-parallel-leader-participation" xreflabel="parallel_leader_participation">
        <term>
        <varname>parallel_leader_participation</varname> (<type>boolean</type>)

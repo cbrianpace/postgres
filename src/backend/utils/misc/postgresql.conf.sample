@@ -236,6 +236,7 @@
 #max_parallel_workers = 8               # number of max_worker_processes that
                                         # can be used in parallel operations
 #parallel_leader_participation = on
+#parallel_worker_queue_timeout = 0      # in milliseconds, 0 is disabled
 
 
 #------------------------------------------------------------------------------

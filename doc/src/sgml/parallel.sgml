@@ -75,7 +75,11 @@ EXPLAIN SELECT * FROM pgbench_accounts WHERE filler LIKE '%x%';
     <varname>max_worker_processes</varname> and <varname>max_parallel_workers</varname>
     so that more workers can be run simultaneously or alternatively reducing
     <varname>max_parallel_workers_per_gather</varname> so that the planner
-    requests fewer workers.
+    requests fewer workers.  Alternatively, setting
+    <xref linkend="guc-parallel-worker-queue-timeout"/> allows the leader to
+    wait a limited time for workers to become available before proceeding
+    with fewer workers; such waits are visible as the
+    <literal>ParallelWorkerQueue</literal> wait event.
    </para>
 
    <para>

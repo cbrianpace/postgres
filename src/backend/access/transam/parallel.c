@@ -34,6 +34,7 @@
 #include "miscadmin.h"
 #include "optimizer/optimizer.h"
 #include "pgstat.h"
+#include "postmaster/bgworker_internals.h"
 #include "storage/ipc.h"
 #include "storage/predicate.h"
 #include "storage/proc.h"
@@ -45,6 +46,7 @@
 #include "utils/memutils.h"
 #include "utils/relmapper.h"
 #include "utils/snapmgr.h"
+#include "utils/timestamp.h"
 #include "utils/wait_event.h"
 
 /*
@@ -79,6 +81,14 @@
 #define PARALLEL_KEY_RELMAPPER_STATE		UINT64CONST(0xFFFFFFFFFFFF000D)
 #define PARALLEL_KEY_UNCOMMITTEDENUMS		UINT64CONST(0xFFFFFFFFFFFF000E)
 #define PARALLEL_KEY_CLIENTCONNINFO			UINT64CONST(0xFFFFFFFFFFFF000F)
+
+/*
+ * Upper bound, in milliseconds, on a single sleep while waiting for parallel
+ * worker capacity (see parallel_worker_queue_timeout).  Capacity can be
+ * released without anyone broadcasting on the wait condition variable, so we
+ * must recheck periodically.
+ */
+#define PARALLEL_WORKER_QUEUE_POLL_MS		100
 
 /* Fixed-size parallel state. */
 typedef struct FixedParallelState
@@ -162,6 +172,8 @@ static const struct
 /* Private functions. */
 static void ProcessParallelMessage(ParallelContext *pcxt, int i, StringInfo msg);
 static void WaitForParallelWorkersToExit(ParallelContext *pcxt);
+static bool LeaderHoldsOtherParallelWorkers(ParallelContext *self);
+static void WaitForParallelWorkerCapacity(ParallelContext *pcxt);
 static parallel_worker_main_type LookupParallelWorkerFunction(const char *libraryname, const char *funcname);
 static void ParallelWorkerShutdown(int code, Datum arg);
 
@@ -577,6 +589,116 @@ ReinitializeParallelWorkers(ParallelContext *pcxt, int nworkers_to_launch)
 }
 
 /*
+ * Does this backend currently hold registered parallel workers through a
+ * parallel context other than "self"?
+ *
+ * A single leader can have more than one parallel context active at once,
+ * for example when a parallel-restricted function evaluated above a Gather
+ * runs a parallel query of its own.  Workers held by the other context count
+ * against max_parallel_workers, so waiting for capacity could mean waiting
+ * for our own workers, or forming a hold-and-wait cycle with another leader.
+ *
+ * This is conservative: a handle is cleared only once its worker has been
+ * waited for in WaitForParallelWorkersToExit(), so workers that have finished
+ * but not yet been reaped still count as held.
+ */
+static bool
+LeaderHoldsOtherParallelWorkers(ParallelContext *self)
+{
+	dlist_iter	iter;
+
+	dlist_foreach(iter, &pcxt_list)
+	{
+		ParallelContext *pcxt = dlist_container(ParallelContext, node,
+												iter.cur);
+
+		if (pcxt == self || pcxt->worker == NULL)
+			continue;
+		for (int i = 0; i < pcxt->nworkers_launched; i++)
+		{
+			if (pcxt->worker[i].bgwhandle != NULL)
+				return true;
+		}
+	}
+
+	return false;
+}
+
+/*
+ * Wait, for at most parallel_worker_queue_timeout milliseconds, until enough
+ * parallel worker capacity is available to launch all the workers that this
+ * context wants, or as many of them as could ever be obtained given
+ * max_parallel_workers and the background worker slots held by non-parallel
+ * workers.
+ *
+ * This is best effort.  There is no ordering among waiters, and capacity seen
+ * here can be taken by another backend before we register our workers; in
+ * that case the caller simply ends up with fewer workers, as it would have
+ * without waiting.  If the deadline passes, we remember that in the context
+ * so that later launches on it (e.g. rescans) do not wait again.
+ *
+ * Backends that release workers broadcast on a shared condition variable,
+ * but that is only a hint: worker slots can also be freed with no broadcast
+ * at all (a leader exiting abnormally, workers that are reaped by the
+ * postmaster before their leader waits for them), and the broadcast can
+ * occasionally arrive just before the postmaster has updated the counters
+ * we check.  So we also recheck at least every PARALLEL_WORKER_QUEUE_POLL_MS.
+ *
+ * Interrupts, including statement_timeout, are processed while waiting.  If
+ * one throws an error, transaction abort cancels the condition variable
+ * sleep.
+ */
+static void
+WaitForParallelWorkerCapacity(ParallelContext *pcxt)
+{
+	ConditionVariable *cv;
+	TimestampTz deadline;
+	int			max_obtainable;
+	int			nfree;
+
+	/* Never wait while holding workers through another context. */
+	if (LeaderHoldsOtherParallelWorkers(pcxt))
+		return;
+
+	/*
+	 * Return at once if there is enough capacity now, or if no capacity could
+	 * ever be obtained (in which case the target is zero).
+	 */
+	nfree = GetFreeParallelWorkerCount(&max_obtainable);
+	if (nfree >= Min(pcxt->nworkers_to_launch, max_obtainable))
+		return;
+
+	deadline = TimestampTzPlusMilliseconds(GetCurrentTimestamp(),
+										   parallel_worker_queue_timeout);
+	cv = ParallelWorkerWaitCV();
+	ConditionVariablePrepareToSleep(cv);
+	for (;;)
+	{
+		long		remaining;
+
+		CHECK_FOR_INTERRUPTS();
+
+		nfree = GetFreeParallelWorkerCount(&max_obtainable);
+		if (nfree >= Min(pcxt->nworkers_to_launch, max_obtainable))
+			break;
+
+		remaining = TimestampDifferenceMilliseconds(GetCurrentTimestamp(),
+													deadline);
+		if (remaining <= 0)
+		{
+			pcxt->queue_wait_timed_out = true;
+			break;
+		}
+
+		(void) ConditionVariableTimedSleep(cv,
+										   Min(remaining,
+											   PARALLEL_WORKER_QUEUE_POLL_MS),
+										   WAIT_EVENT_PARALLEL_WORKER_QUEUE);
+	}
+	ConditionVariableCancelSleep();
+}
+
+/*
  * Launch parallel workers.
  */
 void
@@ -596,6 +718,20 @@ LaunchParallelWorkers(ParallelContext *pcxt)
 
 	/* If we do have workers, we'd better have a DSM segment. */
 	Assert(pcxt->seg != NULL);
+
+	/*
+	 * If requested, wait a bounded time for parallel worker capacity.  This
+	 * is never done in parallel workers, autovacuum workers (whose GUCs come
+	 * from the configuration file and which should not hold their locks while
+	 * waiting), single-user mode, or a context whose earlier wait already
+	 * timed out.
+	 */
+	if (parallel_worker_queue_timeout > 0 &&
+		IsUnderPostmaster &&
+		!IsParallelWorker() &&
+		!AmAutoVacuumWorkerProcess() &&
+		!pcxt->queue_wait_timed_out)
+		WaitForParallelWorkerCapacity(pcxt);
 
 	/* We might be running in a short-lived memory context. */
 	oldcontext = MemoryContextSwitchTo(TopTransactionContext);
@@ -622,6 +758,8 @@ LaunchParallelWorkers(ParallelContext *pcxt)
 	 * expected, so there is no need to throw an error here if registration
 	 * fails.  It wouldn't help much anyway, because registering the worker in
 	 * no way guarantees that it will start up and initialize successfully.
+	 * The optional wait above makes fewer workers less likely, but cannot
+	 * rule it out.
 	 */
 	for (i = 0; i < pcxt->nworkers_to_launch; ++i)
 	{
@@ -930,6 +1068,7 @@ static void
 WaitForParallelWorkersToExit(ParallelContext *pcxt)
 {
 	int			i;
+	int			nwaited = 0;
 
 	/* Wait until the workers actually die. */
 	for (i = 0; i < pcxt->nworkers_launched; ++i)
@@ -940,6 +1079,8 @@ WaitForParallelWorkersToExit(ParallelContext *pcxt)
 			continue;
 
 		status = WaitForBackgroundWorkerShutdown(pcxt->worker[i].bgwhandle);
+		if (status == BGWH_STOPPED)
+			nwaited++;
 
 		/*
 		 * If the postmaster kicked the bucket, we have no chance of cleaning
@@ -956,6 +1097,16 @@ WaitForParallelWorkersToExit(ParallelContext *pcxt)
 		pfree(pcxt->worker[i].bgwhandle);
 		pcxt->worker[i].bgwhandle = NULL;
 	}
+
+	/*
+	 * Let any backends waiting for parallel worker capacity know that some
+	 * may now be available.  This is not conditional on our own setting of
+	 * parallel_worker_queue_timeout, since other sessions may use a different
+	 * value.  The postmaster may not yet have updated the counters that
+	 * waiters check, which is why they also recheck periodically.
+	 */
+	if (nwaited > 0)
+		SignalParallelWorkerAvailable();
 }
 
 /*

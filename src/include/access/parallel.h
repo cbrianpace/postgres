@@ -47,6 +47,8 @@ typedef struct ParallelContext
 	ParallelWorkerInfo *worker;
 	int			nknown_attached_workers;
 	bool	   *known_attached_workers;
+	bool		queue_wait_timed_out;	/* a wait for worker capacity timed
+										 * out; don't wait again */
 } ParallelContext;
 
 typedef struct ParallelWorkerContext

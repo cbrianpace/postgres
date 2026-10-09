@@ -181,6 +181,7 @@ extern PGDLLIMPORT int MaxConnections;
 extern PGDLLIMPORT int max_worker_processes;
 extern PGDLLIMPORT int max_parallel_workers;
 extern PGDLLIMPORT int autovacuum_max_parallel_workers;
+extern PGDLLIMPORT int parallel_worker_queue_timeout;
 
 extern PGDLLIMPORT int commit_timestamp_buffers;
 extern PGDLLIMPORT int multixact_member_buffers;

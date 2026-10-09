@@ -82,6 +82,21 @@ explain (costs off)
   select count(*) from tenk1 where stringu1 = 'GRAAAA';
 select count(*) from tenk1 where stringu1 = 'GRAAAA';
 
+-- test parallel_worker_queue_timeout: basic GUC handling, and no waiting
+-- when no workers could ever be obtained (else we'd hit statement_timeout)
+show parallel_worker_queue_timeout;
+set parallel_worker_queue_timeout = '5s';
+show parallel_worker_queue_timeout;
+savepoint pwqt;
+set parallel_worker_queue_timeout = -1;
+rollback to savepoint pwqt;
+set parallel_worker_queue_timeout = '1h';
+set local statement_timeout = '30s';
+select count(*) from tenk1 where stringu1 = 'GRAAAA';
+reset parallel_worker_queue_timeout;
+show parallel_worker_queue_timeout;
+reset statement_timeout;
+
 reset max_parallel_workers;
 reset parallel_leader_participation;
 

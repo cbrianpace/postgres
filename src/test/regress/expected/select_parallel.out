@@ -208,6 +208,41 @@ select count(*) from tenk1 where stringu1 = 'GRAAAA';
     15
 (1 row)
 
+-- test parallel_worker_queue_timeout: basic GUC handling, and no waiting
+-- when no workers could ever be obtained (else we'd hit statement_timeout)
+show parallel_worker_queue_timeout;
+ parallel_worker_queue_timeout 
+-------------------------------
+ 0
+(1 row)
+
+set parallel_worker_queue_timeout = '5s';
+show parallel_worker_queue_timeout;
+ parallel_worker_queue_timeout 
+-------------------------------
+ 5s
+(1 row)
+
+savepoint pwqt;
+set parallel_worker_queue_timeout = -1;
+ERROR:  -1 ms is outside the valid range for parameter "parallel_worker_queue_timeout" (0 ms .. 2147483647 ms)
+rollback to savepoint pwqt;
+set parallel_worker_queue_timeout = '1h';
+set local statement_timeout = '30s';
+select count(*) from tenk1 where stringu1 = 'GRAAAA';
+ count 
+-------
+    15
+(1 row)
+
+reset parallel_worker_queue_timeout;
+show parallel_worker_queue_timeout;
+ parallel_worker_queue_timeout 
+-------------------------------
+ 0
+(1 row)
+
+reset statement_timeout;
 reset max_parallel_workers;
 reset parallel_leader_participation;
 -- test that parallel_restricted function doesn't run in worker

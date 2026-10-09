@@ -2343,6 +2343,16 @@
   max => 'DBL_MAX',
 },
 
+{ name => 'parallel_worker_queue_timeout', type => 'int', context => 'PGC_USERSET', group => 'RESOURCES_WORKER_PROCESSES',
+  short_desc => 'Sets the maximum time to wait for parallel workers to become available.',
+  long_desc => '0 disables waiting.',
+  flags => 'GUC_UNIT_MS',
+  variable => 'parallel_worker_queue_timeout',
+  boot_val => '0',
+  min => '0',
+  max => 'INT_MAX',
+},
+
 { name => 'password_encryption', type => 'enum', context => 'PGC_USERSET', group => 'CONN_AUTH_AUTH',
   short_desc => 'Chooses the algorithm for encrypting passwords.',
   variable => 'Password_encryption',
