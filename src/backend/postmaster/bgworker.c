@@ -22,6 +22,7 @@
 #include "postmaster/postmaster.h"
 #include "replication/logicallauncher.h"
 #include "replication/logicalworker.h"
+#include "storage/condition_variable.h"
 #include "storage/ipc.h"
 #include "storage/latch.h"
 #include "storage/lwlock.h"
@@ -94,12 +95,18 @@ typedef struct BackgroundWorkerSlot
  * number of parallel workers is the number of registered workers minus the
  * terminated ones.  These counters can of course overflow, but it's not
  * important here since the subtraction will still give the right number.
+ *
+ * parallel_wait_cv is used by backends that are waiting for parallel worker
+ * capacity to become available (see parallel_worker_queue_timeout).  Leaders
+ * broadcast on it after their workers have exited.  The postmaster must never
+ * touch it, since that would require taking a spinlock.
  */
 typedef struct BackgroundWorkerArray
 {
 	int			total_slots;
 	uint32		parallel_register_count;
 	uint32		parallel_terminate_count;
+	ConditionVariable parallel_wait_cv;
 	BackgroundWorkerSlot slot[FLEXIBLE_ARRAY_MEMBER];
 } BackgroundWorkerArray;
 
@@ -194,6 +201,7 @@ BackgroundWorkerShmemInit(void *arg)
 	BackgroundWorkerData->total_slots = max_worker_processes;
 	BackgroundWorkerData->parallel_register_count = 0;
 	BackgroundWorkerData->parallel_terminate_count = 0;
+	ConditionVariableInit(&BackgroundWorkerData->parallel_wait_cv);
 
 	/*
 	 * Copy contents of worker list into shared memory.  Record the shared
@@ -1208,6 +1216,72 @@ GetBackgroundWorkerPid(BackgroundWorkerHandle *handle, pid_t *pidp)
 		return BGWH_NOT_YET_STARTED;
 	*pidp = pid;
 	return BGWH_STARTED;
+}
+
+/*
+ * Return the number of parallel workers that could be registered right now,
+ * and set *max_obtainable to the most that could be registered if every
+ * currently running parallel worker exited.  Both values reflect the
+ * caller's max_parallel_workers setting, and both account for slots that
+ * are held by non-parallel background workers.
+ *
+ * The result is only advisory: RegisterDynamicBackgroundWorker() rechecks
+ * under an exclusive lock, and the postmaster may release slots at any time.
+ */
+int
+GetFreeParallelWorkerCount(int *max_obtainable)
+{
+	int			active;
+	int			free_slots = 0;
+	int			nonparallel_in_use = 0;
+	int			total_slots;
+
+	LWLockAcquire(BackgroundWorkerLock, LW_SHARED);
+
+	/* Unsigned subtraction, as in RegisterDynamicBackgroundWorker(). */
+	active = (int) (BackgroundWorkerData->parallel_register_count -
+					BackgroundWorkerData->parallel_terminate_count);
+	total_slots = BackgroundWorkerData->total_slots;
+
+	for (int slotno = 0; slotno < total_slots; ++slotno)
+	{
+		BackgroundWorkerSlot *slot = &BackgroundWorkerData->slot[slotno];
+
+		if (!slot->in_use)
+			free_slots++;
+		else if ((slot->worker.bgw_flags & BGWORKER_CLASS_PARALLEL) == 0)
+			nonparallel_in_use++;
+	}
+
+	LWLockRelease(BackgroundWorkerLock);
+
+	*max_obtainable = Max(0, Min(max_parallel_workers,
+								 total_slots - nonparallel_in_use));
+	return Max(0, Min(max_parallel_workers - active, free_slots));
+}
+
+/*
+ * Return the condition variable that backends sleep on while waiting for
+ * parallel worker capacity.
+ */
+ConditionVariable *
+ParallelWorkerWaitCV(void)
+{
+	return &BackgroundWorkerData->parallel_wait_cv;
+}
+
+/*
+ * Wake any backends waiting for parallel worker capacity.  The wakeup is
+ * only a hint; waiters always recheck GetFreeParallelWorkerCount().
+ *
+ * This must never be called from the postmaster, which must not take
+ * spinlocks.
+ */
+void
+SignalParallelWorkerAvailable(void)
+{
+	Assert(IsUnderPostmaster);
+	ConditionVariableBroadcast(&BackgroundWorkerData->parallel_wait_cv);
 }
 
 /*

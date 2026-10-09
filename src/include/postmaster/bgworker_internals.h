@@ -15,6 +15,7 @@
 #include "datatype/timestamp.h"
 #include "lib/ilist.h"
 #include "postmaster/bgworker.h"
+#include "storage/condition_variable.h"
 
 /* GUC options */
 
@@ -48,6 +49,14 @@ extern void ReportBackgroundWorkerExit(RegisteredBgWorker *rw);
 extern void BackgroundWorkerStopNotifications(pid_t pid);
 extern void ForgetUnstartedBackgroundWorkers(void);
 extern void ResetBackgroundWorkerCrashTimes(void);
+
+/*
+ * Support for backends waiting for parallel worker capacity.  These are for
+ * use by regular backends only; the postmaster must never call them.
+ */
+extern int	GetFreeParallelWorkerCount(int *max_obtainable);
+extern ConditionVariable *ParallelWorkerWaitCV(void);
+extern void SignalParallelWorkerAvailable(void);
 
 /* Entry point for background worker processes */
 pg_noreturn extern void BackgroundWorkerMain(const void *startup_data, size_t startup_data_len);
